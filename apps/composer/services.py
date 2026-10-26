@@ -85,6 +85,7 @@ def create_post(
     author=None,
     status: str = "draft",
     platform_overrides: dict[Any, dict[str, str | None]] | None = None,
+    platform_extra: dict[str, Any] | None = None,
 ):
     """Create a ``Post`` + one ``PlatformPost`` for ``social_account``.
 
@@ -179,6 +180,7 @@ def create_post(
         reason = publish_blocker(
             social_account,
             media_types=usable_media_types(asset_map.values()),
+            platform_extra=platform_extra,
         )
         if reason:
             raise ValueError(reason)
@@ -211,6 +213,7 @@ def create_post(
             platform_specific_title=override.get("title"),
             platform_specific_caption=override.get("caption"),
             platform_specific_first_comment=override.get("first_comment"),
+            platform_extra=dict(platform_extra or {}),
         )
         for position, (_mid, u) in enumerate(resolved):
             # ``u`` is validated non-None and present in ``asset_map`` above

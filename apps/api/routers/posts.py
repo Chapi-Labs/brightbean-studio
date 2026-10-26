@@ -33,8 +33,14 @@ from apps.api.middleware import (
     log_audit_entry,
     release_idempotent_claim,
 )
+from apps.api.platform_options import (
+    build_platform_extra_from_entries,
+    entry_to_options_dict,
+    validate_and_build_extra_for_account,
+)
 from apps.api.schemas import (
     CreatePostRequest,
+    PlatformOptionsEntry,
     PostResponse,
     ScheduleRequest,
     UpdatePostRequest,
@@ -67,6 +73,38 @@ def _require_perm(request: HttpRequest, key: str) -> None:
     membership = getattr(request, "workspace_membership", None)
     if membership is None or not membership.effective_permissions.get(key, False):
         raise HttpError(403, f"Permission denied: {key}")
+
+
+def _apply_platform_options_patch(
+    post: Post,
+    entries: list[PlatformOptionsEntry],
+) -> None:
+    """Merge ``platform_options`` into each matching ``PlatformPost``."""
+    pp_by_account = {pp.social_account_id: pp for pp in post.platform_posts.all()}
+    allowed_ids = set(pp_by_account)
+    media_types = set(
+        post.media_attachments.filter(media_asset__file__gt="").values_list(
+            "media_asset__media_type", flat=True
+        )
+    )
+    for entry in entries:
+        if entry.social_account_id not in allowed_ids:
+            raise HttpError(
+                422,
+                f"platform_options[*].social_account_id {entry.social_account_id} is not a target of this post.",
+            )
+        pp = pp_by_account[entry.social_account_id]
+        options = entry_to_options_dict(entry)
+        built, err = validate_and_build_extra_for_account(
+            pp.social_account.platform,
+            options,
+            existing=pp.platform_extra or {},
+            media_types=media_types,
+        )
+        if err:
+            raise HttpError(422, err)
+        pp.platform_extra = built
+        pp.save(update_fields=["platform_extra", "updated_at"])
 
 
 def _resolve_account(request: HttpRequest, social_account_id: uuid.UUID) -> SocialAccount:
@@ -185,6 +223,24 @@ def create(request, payload: CreatePostRequest):
             "first_comment": ov.first_comment,
         }
 
+    from apps.media_library.models import MediaAsset
+
+    preview_media_types: set[str] = set()
+    if payload.media_asset_ids:
+        preview_media_types = set(
+            MediaAsset.objects.filter(
+                id__in=payload.media_asset_ids, workspace=request.api_key.workspace
+            ).values_list("media_type", flat=True)
+        )
+    platform_extra, po_err = build_platform_extra_from_entries(
+        platform=social_account.platform,
+        target_account_id=payload.social_account_id,
+        entries=payload.platform_options,
+        media_types=preview_media_types,
+    )
+    if po_err:
+        raise HttpError(422, po_err)
+
     # ---- Atomic claim-first idempotency. Three early-out branches
     # before we do *any* mutating work, so concurrent identical retries
     # can never both reach create_post:
@@ -256,6 +312,7 @@ def create(request, payload: CreatePostRequest):
             author=request.user if not request.user.is_anonymous else None,
             status="scheduled" if payload.action == "schedule" else "draft",
             platform_overrides=platform_overrides,
+            platform_extra=platform_extra,
         )
         body = _post_to_response(request, post)
         status_code = 201
@@ -397,6 +454,9 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
                     media_asset=resolved_assets[mid],
                     position=position,
                 )
+
+        if payload.platform_options is not None:
+            _apply_platform_options_patch(post, payload.platform_options)
 
         if update_fields:
             post.save(update_fields=[*update_fields, "updated_at"])
