@@ -91,9 +91,25 @@ class AccountSummary(Schema):
             "rejected with 422."
         ),
     )
+    supported_post_types: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Post types the platform provider can publish (provider enum values). "
+            "For Instagram, also use ``platform_options.post_type`` with feed/reel/story when creating via the API."
+        ),
+    )
+    api_post_types: list[str] = Field(
+        default_factory=list,
+        description=(
+            "``post_type`` values accepted in ``platform_options`` for this account "
+            "(e.g. feed, reel, story on Instagram). Empty when the API exposes no post_type knob."
+        ),
+    )
 
     @classmethod
     def from_social_account(cls, sa) -> AccountSummary:
+        from apps.api.platform_options import provider_supported_post_types, supported_post_type_values
+
         return cls(
             id=sa.id,
             platform=sa.platform,
@@ -106,6 +122,8 @@ class AccountSummary(Schema):
             supports_first_comment=sa.supports_first_comment(),
             requires_video=is_video_only(sa.platform),
             requires_media=requires_media(sa.platform),
+            supported_post_types=provider_supported_post_types(sa.platform),
+            api_post_types=supported_post_type_values(sa.platform),
         )
 
 
@@ -143,6 +161,44 @@ class AccountsListResponse(Schema):
 
 
 PostAction = Literal["draft", "schedule"]
+
+
+class PlatformOptionsEntry(Schema):
+    """Per-account publish options stored in ``PlatformPost.platform_extra``.
+
+    Only fields supported by the target platform are accepted; others return
+    422. Omit a field (or send ``null`` on PATCH) to leave it unchanged.
+    """
+
+    social_account_id: uuid.UUID = Field(
+        ...,
+        description="Must reference an account that is a child of this post.",
+    )
+    post_type: str | None = Field(
+        None,
+        description=(
+            "Instagram / Instagram Login: ``feed`` (default feed post), ``reel``, or ``story``. "
+            "Facebook: ``feed``, ``reel``, or ``video`` (regular Page video; same as feed for a lone video)."
+        ),
+    )
+    is_aigc: bool | None = Field(
+        None,
+        description="TikTok only. When true, discloses AI-generated content to TikTok (``post_info.is_aigc``).",
+    )
+    privacy_level: str | None = Field(
+        None,
+        description="TikTok only. One of PUBLIC_TO_EVERYONE, MUTUAL_FOLLOW_FRIENDS, FOLLOWER_OF_CREATOR, SELF_ONLY.",
+    )
+    allow_comment: bool | None = Field(None, description="TikTok only. Allow viewers to comment.")
+    allow_duet: bool | None = Field(None, description="TikTok only. Allow Duet.")
+    allow_stitch: bool | None = Field(None, description="TikTok only. Allow Stitch.")
+    brand_organic: bool | None = Field(None, description="TikTok only. Your brand organic disclosure toggle.")
+    brand_content: bool | None = Field(None, description="TikTok only. Branded content disclosure toggle.")
+    video_cover_timestamp_ms: int | None = Field(
+        None,
+        ge=0,
+        description="TikTok only. Cover frame timestamp in milliseconds; omitted uses TikTok's first frame.",
+    )
 
 
 class PlatformOverride(Schema):
@@ -215,6 +271,14 @@ class CreatePostRequest(Schema):
             "omitting it) leaves the post's default in place for that platform."
         ),
     )
+    platform_options: list[PlatformOptionsEntry] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-platform publish options (Instagram Story, TikTok privacy / AI label, …). "
+            "Persisted in ``platform_extra``. Each entry's social_account_id must match the post's "
+            "social_account_id. Unsupported fields for the target platform are rejected with 422."
+        ),
+    )
     action: PostAction = Field(
         "draft",
         description=(
@@ -259,6 +323,13 @@ class UpdatePostRequest(Schema):
         None,
         description="Set a draft's suggested publish time (UTC). Sending null is a no-op (cannot clear via PATCH).",
     )
+    platform_options: list[PlatformOptionsEntry] | None = Field(
+        None,
+        description=(
+            "Merge per-platform publish options into ``platform_extra``. "
+            "Omitted fields are left unchanged. Each entry's social_account_id must match a child of this post."
+        ),
+    )
 
 
 class ScheduleRequest(Schema):
@@ -279,6 +350,10 @@ class PlatformPostSummary(Schema):
     published_at: dt.datetime | None
     platform_post_id: str = ""
     publish_error: str = ""
+    platform_options: dict = Field(
+        default_factory=dict,
+        description="Per-platform publish options (round-trip of create/update ``platform_options``).",
+    )
 
     @field_serializer("scheduled_at", "published_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
@@ -286,15 +361,19 @@ class PlatformPostSummary(Schema):
 
     @classmethod
     def from_platform_post(cls, pp: PlatformPost) -> PlatformPostSummary:
+        from apps.api.platform_options import platform_extra_to_api_options
+
+        platform = pp.social_account.platform
         return cls(
             id=pp.id,
             social_account_id=pp.social_account_id,
-            platform=pp.social_account.platform,
+            platform=platform,
             status=pp.status,
             scheduled_at=pp.scheduled_at,
             published_at=pp.published_at,
             platform_post_id=pp.platform_post_id or "",
             publish_error=pp.publish_error or "",
+            platform_options=platform_extra_to_api_options(platform, pp.platform_extra),
         )
 
 

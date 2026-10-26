@@ -148,6 +148,9 @@ class TestPerPlatformCapabilities:
         # Facebook: also defaults to supports_first_comment=True.
         assert accs["facebook"]["supports_first_comment"] is True
 
+        assert accs["facebook"]["api_post_types"] == ["feed", "reel", "video"]
+        assert accs["tiktok"]["api_post_types"] == []
+
         # LinkedIn escapes its reserved set, so a client budgeting char_limit
         # against the raw caption would overflow; every other platform publishes
         # the caption verbatim.

@@ -190,6 +190,67 @@ def _parse_iso_datetime(value: Any, field_name: str) -> datetime:
     return parsed
 
 
+_MCP_PLATFORM_OPTIONS_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "social_account_id": {"type": "string", "format": "uuid"},
+        "post_type": {
+            "type": "string",
+            "description": "Instagram: feed|reel|story. Facebook: feed|reel|video.",
+        },
+        "is_aigc": {"type": "boolean", "description": "TikTok AI-generated content disclosure."},
+        "privacy_level": {"type": "string"},
+        "allow_comment": {"type": "boolean"},
+        "allow_duet": {"type": "boolean"},
+        "allow_stitch": {"type": "boolean"},
+        "brand_organic": {"type": "boolean"},
+        "brand_content": {"type": "boolean"},
+        "video_cover_timestamp_ms": {"type": "integer", "minimum": 0},
+    },
+    "required": ["social_account_id"],
+    "additionalProperties": False,
+}
+
+
+def _parse_platform_options_arg(args: dict, social_account_id: UUID) -> list:
+    from apps.api.schemas import PlatformOptionsEntry
+
+    raw = args.get("platform_options") or []
+    if not isinstance(raw, list):
+        raise JsonRpcError(INVALID_PARAMS, "platform_options must be an array")
+    entries: list[PlatformOptionsEntry] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise JsonRpcError(INVALID_PARAMS, f"platform_options[{idx}] must be an object")
+        try:
+            entries.append(PlatformOptionsEntry.model_validate(item))
+        except Exception as exc:
+            raise JsonRpcError(INVALID_PARAMS, f"platform_options[{idx}]: {exc}") from exc
+    return entries
+
+
+def _platform_extra_for_create(sa: SocialAccount, args: dict) -> dict:
+    from apps.api.platform_options import build_platform_extra_from_entries
+    from apps.media_library.models import MediaAsset
+
+    entries = _parse_platform_options_arg(args, sa.id)
+    media_ids = args.get("media_asset_ids") or []
+    media_types: set[str] = set()
+    if media_ids:
+        media_types = set(
+            MediaAsset.objects.filter(id__in=media_ids, workspace=sa.workspace).values_list("media_type", flat=True)
+        )
+    extra, err = build_platform_extra_from_entries(
+        platform=sa.platform,
+        target_account_id=sa.id,
+        entries=entries,
+        media_types=media_types,
+    )
+    if err:
+        raise JsonRpcError(INVALID_PARAMS, err)
+    return extra
+
+
 # ---------------------------------------------------------------------------
 # Tool: list_accounts
 # ---------------------------------------------------------------------------
@@ -210,7 +271,8 @@ register_tool(
         description=(
             "List the social media accounts this API key is allowed to act on. "
             "Returns id, platform, account_name, account_handle, connection_status, char_limit, "
-            "escaped_chars, needs_title, supports_first_comment, requires_video, and requires_media. "
+            "escaped_chars, needs_title, supports_first_comment, requires_video, requires_media, "
+            "supported_post_types, and api_post_types. "
             "Call this first to discover which "
             "social_account_id values are valid and what each platform requires."
         ),
@@ -237,6 +299,7 @@ def _create_draft(args: dict, context: dict[str, Any]) -> dict:
     proposed_publish_at = None
     if args.get("proposed_publish_at") is not None:
         proposed_publish_at = _parse_iso_datetime(args["proposed_publish_at"], "proposed_publish_at")
+    platform_extra = _platform_extra_for_create(sa, args)
     try:
         post = create_post(
             workspace=api_key.workspace,
@@ -249,6 +312,7 @@ def _create_draft(args: dict, context: dict[str, Any]) -> dict:
             proposed_publish_at=proposed_publish_at,
             author=api_key.issued_by if api_key.issued_by_id else None,
             status="draft",
+            platform_extra=platform_extra,
         )
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -298,6 +362,15 @@ register_tool(
                         "not validated against the future, and never queued for publishing."
                     ),
                 },
+                "platform_options": {
+                    "type": "array",
+                    "items": _MCP_PLATFORM_OPTIONS_ITEM_SCHEMA,
+                    "default": [],
+                    "description": (
+                        "Per-platform publish options (same shape as REST POST /posts platform_options). "
+                        "social_account_id must match social_account_id."
+                    ),
+                },
             },
             "required": ["social_account_id", "caption"],
             "additionalProperties": False,
@@ -338,6 +411,7 @@ def _schedule_post(args: dict, context: dict[str, Any]) -> dict:
             INVALID_PARAMS,
             f"Per-platform daily quota reached for {sa.platform}: {exc.message}",
         ) from exc
+    platform_extra = _platform_extra_for_create(sa, args)
     try:
         post = create_post(
             workspace=api_key.workspace,
@@ -350,6 +424,7 @@ def _schedule_post(args: dict, context: dict[str, Any]) -> dict:
             scheduled_at=scheduled_at,
             author=api_key.issued_by if api_key.issued_by_id else None,
             status="scheduled",
+            platform_extra=platform_extra,
         )
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -386,6 +461,11 @@ register_tool(
                 "media_asset_ids": {
                     "type": "array",
                     "items": {"type": "string", "format": "uuid"},
+                    "default": [],
+                },
+                "platform_options": {
+                    "type": "array",
+                    "items": _MCP_PLATFORM_OPTIONS_ITEM_SCHEMA,
                     "default": [],
                 },
             },
