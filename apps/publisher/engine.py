@@ -1318,6 +1318,12 @@ class PublishEngine:
             self._mark_confirmed_published(platform_post, status.platform_post_id or handle)
             return True
 
+        if status.state is PublishState.INBOX and (platform_post.platform_extra or {}).get("post_mode") == "inbox":
+            # Inbox mode asked for exactly this: the video is in the creator's
+            # TikTok inbox and they finish the post in the app. Success for us.
+            self._mark_confirmed_published(platform_post, handle)
+            return True
+
         if status.state in (PublishState.FAILED, PublishState.INBOX):
             self._fail_permanently(
                 platform_post,

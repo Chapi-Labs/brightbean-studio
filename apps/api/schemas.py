@@ -181,9 +181,22 @@ class PlatformOptionsEntry(Schema):
             "Facebook: ``feed``, ``reel``, or ``video`` (regular Page video; same as feed for a lone video)."
         ),
     )
+    post_mode: Literal["direct", "inbox"] | None = Field(
+        None,
+        description=(
+            "TikTok only. ``direct`` (default) publishes via Direct Post; public posts need an app that "
+            "passed TikTok's content-posting audit. ``inbox`` uploads the video to the creator's TikTok "
+            "inbox as a draft (``video.upload`` scope, no audit); the creator adds caption, privacy and the "
+            "AI label in the TikTok app. In inbox mode caption/post_info options are not sent to TikTok. "
+            "TikTok allows at most 5 pending inbox uploads per 24 hours."
+        ),
+    )
     is_aigc: bool | None = Field(
         None,
-        description="TikTok only. When true, discloses AI-generated content to TikTok (``post_info.is_aigc``).",
+        description=(
+            "TikTok only. When true, discloses AI-generated content to TikTok (``post_info.is_aigc``). "
+            "Ignored when ``post_mode`` is ``inbox`` (TikTok's upload endpoint has no post_info)."
+        ),
     )
     privacy_level: str | None = Field(
         None,

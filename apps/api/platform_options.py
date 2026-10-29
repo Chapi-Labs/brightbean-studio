@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from providers import PROVIDER_REGISTRY
-from providers.tiktok import VALID_PRIVACY_LEVELS
+from providers.tiktok import VALID_POST_MODES, VALID_PRIVACY_LEVELS
 from providers.types import PostType
 
 # API-facing post_type values per platform (subset of what the publisher accepts).
@@ -22,6 +22,7 @@ FacebookPostType = Literal["feed", "reel", "video"]
 _API_OPTION_FIELDS = frozenset(
     {
         "post_type",
+        "post_mode",
         "is_aigc",
         "privacy_level",
         "allow_comment",
@@ -39,6 +40,7 @@ _PLATFORM_FIELDS: dict[str, frozenset[str]] = {
     "facebook": frozenset({"post_type"}),
     "tiktok": frozenset(
         {
+            "post_mode",
             "is_aigc",
             "privacy_level",
             "allow_comment",
@@ -108,6 +110,10 @@ def validate_platform_options_entry(
         if post_type == "story" and media_types is not None and not media_types:
             return "Instagram Story requires at least one image or video in media_asset_ids."
 
+    post_mode = options.get("post_mode")
+    if post_mode is not None and post_mode not in VALID_POST_MODES:
+        return f"post_mode must be one of {sorted(VALID_POST_MODES)}; got {post_mode!r}."
+
     privacy = options.get("privacy_level")
     if privacy is not None and privacy not in VALID_PRIVACY_LEVELS:
         return f"privacy_level must be one of {sorted(VALID_PRIVACY_LEVELS)}; got {privacy!r}."
@@ -169,6 +175,8 @@ def api_options_to_platform_extra(
             extra["post_type"] = mapped
 
     if platform == "tiktok":
+        if "post_mode" in options and options["post_mode"] is not None:
+            extra["post_mode"] = options["post_mode"]
         if "privacy_level" in options and options["privacy_level"] is not None:
             extra["privacy_level"] = options["privacy_level"]
         for api_field, storage_field, invert in (
@@ -198,6 +206,8 @@ def platform_extra_to_api_options(platform: str, extra: dict[str, Any] | None) -
     if api_pt is not None:
         out["post_type"] = api_pt
     if platform == "tiktok":
+        if "post_mode" in extra:
+            out["post_mode"] = extra["post_mode"]
         if "privacy_level" in extra:
             out["privacy_level"] = extra["privacy_level"]
         if "disable_comment" in extra:

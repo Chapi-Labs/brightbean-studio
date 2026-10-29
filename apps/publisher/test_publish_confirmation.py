@@ -173,6 +173,28 @@ class AsyncPublishConfirmationTest(PendingPublishTestCase):
         assert self.pp.status == PlatformPost.Status.FAILED
         assert "duration_check_failed" in self.pp.publish_error
 
+    def test_inbox_delivery_is_success_when_inbox_mode_was_requested(self):
+        PlatformPost.objects.filter(pk=self.pp.pk).update(
+            platform_post_id="v_inbox_file~abc", platform_extra={"post_mode": "inbox"}
+        )
+        self.pp.refresh_from_db()
+        provider = MagicMock(publish_is_async=True)
+        provider.check_publish_status.return_value = _status(PublishState.INBOX, error="finish in the TikTok app")
+
+        settled = self._sweep(provider)
+
+        assert settled == 1
+        assert self.pp.status == PlatformPost.Status.PUBLISHED
+        assert self.pp.platform_post_id == "v_inbox_file~abc"
+
+    def test_inbox_delivery_is_still_a_failure_for_direct_posts(self):
+        provider = MagicMock(publish_is_async=True)
+        provider.check_publish_status.return_value = _status(PublishState.INBOX, error="finish in the TikTok app")
+
+        self._sweep(provider)
+
+        assert self.pp.status == PlatformPost.Status.FAILED
+
     def test_still_processing_is_left_in_flight(self):
         provider = MagicMock(publish_is_async=True)
         provider.check_publish_status.return_value = _status(PublishState.PENDING)

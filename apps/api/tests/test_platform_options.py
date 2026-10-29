@@ -276,3 +276,59 @@ class TestTikTokPlatformOptions:
 
         _token, content = mock_provider.publish_post.call_args.args
         assert content.extra.get("is_aigc") is True
+
+    def test_post_mode_inbox_round_trips(self, client_with_token, tt_account, video_asset):
+        r = _post(
+            client_with_token,
+            {
+                "social_account_id": str(tt_account.id),
+                "caption": "inbox clip",
+                "media_asset_ids": [str(video_asset.id)],
+                "platform_options": [
+                    {"social_account_id": str(tt_account.id), "post_mode": "inbox"},
+                ],
+                "action": "draft",
+            },
+        )
+        assert r.status_code == 201, r.content
+        pp = PlatformPost.objects.get(social_account=tt_account)
+        assert pp.platform_extra["post_mode"] == "inbox"
+        assert r.json()["platform_posts"][0]["platform_options"]["post_mode"] == "inbox"
+
+    def test_post_mode_rejects_unknown_value(self, client_with_token, tt_account, video_asset):
+        r = _post(
+            client_with_token,
+            {
+                "social_account_id": str(tt_account.id),
+                "caption": "bad mode",
+                "media_asset_ids": [str(video_asset.id)],
+                "platform_options": [
+                    {"social_account_id": str(tt_account.id), "post_mode": "drafts"},
+                ],
+                "action": "draft",
+            },
+        )
+        assert r.status_code in (400, 422), r.content
+        assert not PlatformPost.objects.filter(social_account=tt_account).exists()
+
+    def test_tiktok_publish_passes_post_mode_to_provider(self, tt_account, video_asset, workspace, user):
+        post = Post.objects.create(workspace=workspace, author=user, caption="inbox")
+        pp = PlatformPost.objects.create(
+            post=post,
+            social_account=tt_account,
+            platform_extra={"post_mode": "inbox"},
+        )
+        PostMedia.objects.create(post=post, media_asset=video_asset, position=0)
+
+        mock_provider = MagicMock()
+        mock_provider.publish_post.return_value = MagicMock(platform_post_id="x", extra={})
+        mock_provider.supported_post_types = [PostType.VIDEO]
+
+        with (
+            patch("apps.publisher.engine.get_provider", return_value=mock_provider),
+            patch("apps.publisher.engine.download_to_path"),
+        ):
+            PublishEngine()._dispatch_to_provider(pp)
+
+        _token, content = mock_provider.publish_post.call_args.args
+        assert content.extra.get("post_mode") == "inbox"

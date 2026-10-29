@@ -54,6 +54,8 @@ PERMANENT_PUBLISH_ERROR_CODES = frozenset(
         "scope_not_authorized",
         "scope_permission_missed",
         "url_ownership_unverified",
+        "spam_risk_too_many_pending_share",
+        "spam_risk_user_banned_from_posting",
     }
 )
 
@@ -95,6 +97,22 @@ PUBLISH_STATE_BY_TIKTOK_STATUS = {
     # us, and the one outcome where "failed" needs a very specific sentence.
     "SEND_TO_USER_INBOX": PublishState.INBOX,
 }
+
+# ``platform_extra["post_mode"]`` values.
+#   direct — Direct Post (/post/publish/video/init/, ``video.publish`` scope).
+#            Public posts need an app that passed TikTok's content-posting audit.
+#   inbox  — Upload to the creator's TikTok inbox as a draft
+#            (/post/publish/inbox/video/init/, ``video.upload`` scope). Needs no
+#            audit; the creator finishes the post (caption, privacy, AI label)
+#            in the TikTok app. TikTok caps this at 5 pending inbox uploads per
+#            24 hours per creator.
+POST_MODE_DIRECT = "direct"
+POST_MODE_INBOX = "inbox"
+VALID_POST_MODES = frozenset({POST_MODE_DIRECT, POST_MODE_INBOX})
+
+INBOX_DELIVERED_NOTE = (
+    "Uploaded to the TikTok inbox. Open TikTok (inbox notification or drafts) to add the caption and publish it."
+)
 
 INBOX_HINT = (
     "TikTok put this video in your TikTok inbox as a draft instead of posting it. "
@@ -296,6 +314,12 @@ class TikTokProvider(SocialProvider):
         )
         return resp.json().get("data", {}) or {}
 
+    @staticmethod
+    def post_mode(extra: dict | None) -> str:
+        """The publish mode stored in ``platform_extra`` (default: direct)."""
+        mode = (extra or {}).get("post_mode") or POST_MODE_DIRECT
+        return mode if mode in VALID_POST_MODES else POST_MODE_DIRECT
+
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
         if content.post_type != PostType.VIDEO:
             raise PublishError(
@@ -303,6 +327,9 @@ class TikTokProvider(SocialProvider):
                 platform=self.platform_name,
                 retryable=False,
             )
+
+        if self.post_mode(content.extra) == POST_MODE_INBOX:
+            return self._upload_to_inbox(access_token, content)
 
         privacy_level_is_explicit = "privacy_level" in content.extra
         privacy_level = content.extra.get("privacy_level", DEFAULT_PRIVACY_LEVEL)
@@ -385,16 +412,19 @@ class TikTokProvider(SocialProvider):
             )
         return privacy_level
 
-    def _init_video_publish(self, access_token: str, payload: dict) -> dict:
-        """POST to /post/publish/video/init/ and return the parsed body.
+    def _init_video_publish(self, access_token: str, payload: dict, *, inbox: bool = False) -> dict:
+        """POST to the video init endpoint and return the parsed body.
 
-        Permanent TikTok error codes are re-raised as non-retryable
-        PublishErrors via :meth:`_raise_classified_publish_error`.
+        ``inbox=True`` targets /post/publish/inbox/video/init/ (upload as a
+        draft to the creator's inbox); otherwise /post/publish/video/init/
+        (Direct Post). Permanent TikTok error codes are re-raised as
+        non-retryable PublishErrors via :meth:`_raise_classified_publish_error`.
         """
+        path = "post/publish/inbox/video/init/" if inbox else "post/publish/video/init/"
         try:
             resp = self._request(
                 "POST",
-                f"{API_BASE}/post/publish/video/init/",
+                f"{API_BASE}/{path}",
                 access_token=access_token,
                 json=payload,
             )
@@ -427,12 +457,44 @@ class TikTokProvider(SocialProvider):
         message = f"TikTok rejected the post ({code}): {exc}"
         if code == "unaudited_client_can_only_post_to_private_accounts":
             message = f"TikTok rejected the post: {UNAUDITED_CLIENT_HINT}"
+        elif code == "spam_risk_too_many_pending_share":
+            message = (
+                "TikTok rejected the upload: there are already 5 videos waiting in the "
+                "TikTok inbox from the last 24 hours. Publish or delete them in the "
+                "TikTok app, then reschedule this post."
+            )
         raise PublishError(
             message,
             platform=self.platform_name,
             raw_response=exc.raw_response,
             retryable=False,
         ) from exc
+
+    def _upload_to_inbox(self, access_token: str, content: PublishContent) -> PublishResult:
+        """Upload the video to the creator's TikTok inbox (no Direct Post audit needed).
+
+        The inbox endpoint takes only ``source_info``: caption, privacy, AI
+        label and the other ``post_info`` fields cannot be sent and are set by
+        the creator in the TikTok app when they finish the post. creator_info
+        is skipped too — it describes Direct Post capabilities.
+        """
+        if content.media_files:
+            return self._file_upload(access_token, content, post_info=None)
+        if content.media_urls:
+            payload = {
+                "source_info": {
+                    "source": "PULL_FROM_URL",
+                    "video_url": content.media_urls[0],
+                },
+            }
+            body = self._init_video_publish(access_token, payload, inbox=True)
+            data = body.get("data", {}) or {}
+            return PublishResult(platform_post_id=data.get("publish_id", ""), extra={**data, "post_mode": "inbox"})
+        raise PublishError(
+            "No video source provided (media_files or media_urls required)",
+            platform=self.platform_name,
+            retryable=False,
+        )
 
     def _publish_pull_from_url(
         self,
@@ -462,6 +524,21 @@ class TikTokProvider(SocialProvider):
         privacy_level: str,
     ) -> PublishResult:
         """Publish using FILE_UPLOAD source (two-step)."""
+        return self._file_upload(
+            access_token,
+            content,
+            post_info=self._build_post_info(content, privacy_level),
+        )
+
+    def _file_upload(
+        self,
+        access_token: str,
+        content: PublishContent,
+        *,
+        post_info: dict | None,
+    ) -> PublishResult:
+        """FILE_UPLOAD init + PUT. ``post_info=None`` means inbox upload."""
+        inbox = post_info is None
         video_path = content.media_files[0]
         video_size = os.path.getsize(video_path)
         if video_size > MAX_SINGLE_CHUNK_SIZE:
@@ -481,8 +558,7 @@ class TikTokProvider(SocialProvider):
         content_type = CONTENT_TYPE_BY_EXT.get(ext, "video/mp4")
 
         # Step 1: initialize upload with size metadata TikTok requires
-        payload = {
-            "post_info": self._build_post_info(content, privacy_level),
+        payload: dict = {
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": video_size,
@@ -490,7 +566,9 @@ class TikTokProvider(SocialProvider):
                 "total_chunk_count": 1,
             },
         }
-        init_body = self._init_video_publish(access_token, payload)
+        if post_info is not None:
+            payload = {"post_info": post_info, **payload}
+        init_body = self._init_video_publish(access_token, payload, inbox=inbox)
         upload_url = init_body.get("data", {}).get("upload_url")
         publish_id = init_body.get("data", {}).get("publish_id", "")
 
@@ -518,9 +596,12 @@ class TikTokProvider(SocialProvider):
                 timeout=120.0,
             )
 
+        data = dict(init_body.get("data", {}) or {})
+        if inbox:
+            data["post_mode"] = POST_MODE_INBOX
         return PublishResult(
             platform_post_id=publish_id,
-            extra=init_body.get("data", {}),
+            extra=data,
         )
 
     def check_publish_status(self, access_token: str, handle: str) -> PublishStatus:

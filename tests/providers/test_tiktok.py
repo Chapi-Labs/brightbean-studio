@@ -358,6 +358,7 @@ class TestAccountMetricsPersistence:
 
 CREATOR_INFO_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
 VIDEO_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+INBOX_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 
 
 def _video_content(**extra) -> PublishContent:
@@ -610,6 +611,70 @@ class TestPublishPost:
 
         assert excinfo.value.retryable is False
         mock_request.assert_not_called()
+
+
+class TestInboxUpload:
+    """post_mode=inbox uploads a draft to the creator's TikTok inbox."""
+
+    @patch.object(TikTokProvider, "_request")
+    def test_inbox_pull_from_url_skips_creator_info_and_post_info(self, mock_request):
+        mock_request.return_value = _make_response({"data": {"publish_id": "v_inbox_url~1"}})
+
+        result = TikTokProvider({}).publish_post(
+            "tok", _video_content(post_mode="inbox", is_aigc=True, privacy_level="PUBLIC_TO_EVERYONE")
+        )
+
+        urls = [call.args[1] for call in mock_request.call_args_list]
+        assert urls == [INBOX_INIT_URL]
+        body = mock_request.call_args.kwargs["json"]
+        assert body == {"source_info": {"source": "PULL_FROM_URL", "video_url": "https://cdn.example.com/video.mp4"}}
+        assert result.platform_post_id == "v_inbox_url~1"
+        assert result.extra["post_mode"] == "inbox"
+
+    @patch.object(TikTokProvider, "_request")
+    def test_inbox_file_upload_inits_on_inbox_endpoint_then_puts(self, mock_request, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\0" * 1024)
+        mock_request.return_value = _make_response(
+            {"data": {"publish_id": "v_inbox_file~2", "upload_url": "https://upload.tiktok/y"}}
+        )
+
+        result = TikTokProvider({}).publish_post(
+            "tok",
+            PublishContent(text="hi", post_type=PostType.VIDEO, media_files=[str(video)], extra={"post_mode": "inbox"}),
+        )
+
+        init_call = mock_request.call_args_list[0]
+        assert init_call.args == ("POST", INBOX_INIT_URL)
+        assert "post_info" not in init_call.kwargs["json"]
+        assert init_call.kwargs["json"]["source_info"]["video_size"] == 1024
+        put_call = mock_request.call_args_list[1]
+        assert put_call.args[:2] == ("PUT", "https://upload.tiktok/y")
+        assert result.platform_post_id == "v_inbox_file~2"
+
+    @patch.object(TikTokProvider, "_request")
+    def test_too_many_pending_inbox_shares_is_permanent(self, mock_request):
+        mock_request.side_effect = APIError(
+            "TikTok API error 403",
+            platform="TikTok",
+            status_code=403,
+            raw_response={"error": {"code": "spam_risk_too_many_pending_share", "message": "too many"}},
+        )
+
+        with pytest.raises(PublishError) as exc:
+            TikTokProvider({}).publish_post("tok", _video_content(post_mode="inbox"))
+
+        assert exc.value.retryable is False
+        assert "5 videos" in str(exc.value)
+
+    @patch.object(TikTokProvider, "_request")
+    def test_direct_mode_is_the_default(self, mock_request):
+        mock_request.side_effect = [_creator_info_response(["SELF_ONLY"]), _init_response()]
+
+        TikTokProvider({}).publish_post("tok", _video_content(post_mode="direct"))
+
+        urls = [call.args[1] for call in mock_request.call_args_list]
+        assert urls == [CREATOR_INFO_URL, VIDEO_INIT_URL]
 
 
 class TestCheckPublishStatus:
